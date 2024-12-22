@@ -1,0 +1,412 @@
+---
+title: "AML"
+output: html_document
+date: "2023-11-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(MASS)
+library(reshape2)
+library(rsample)
+library(e1071)
+library(randomForest)
+library(caret)
+library(ranger)
+library(kernlab)
+library(pROC)
+library(PRROC)
+set.seed(123)
+
+df <- read_csv("data/telescope_data.csv")
+df <- df[2:12]
+```
+
+## Visualization
+
+1.  **fLength:** continuous - major axis of ellipse [mm]
+2.  **fWidth:** continuous - minor axis of ellipse [mm]
+3.  **fSize:** continuous - 10-log of sum of content of all pixels [in #phot]
+4.  **fConc:** continuous - ratio of sum of two highest pixels over fSize [ratio]
+5.  **fConc1:** continuous - ratio of highest pixel over fSize [ratio]
+6.  **fAsym:** continuous - distance from highest pixel to center, projected onto major axis [mm]
+7.  **fM3Long:** continuous - 3rd root of third moment along major axis [mm]
+8.  **fM3Trans:** continuous - 3rd root of third moment along minor axis [mm]
+9.  **fAlpha:** continuous - angle of major axis with vector to origin [deg]
+10. **fDist:** continuous - distance from origin to center of ellipse [mm]
+11. **class:** g,h - gamma (signal), hadron (background)
+
+```{r}
+pairs(df[,1:10])
+```
+
+```{r}
+cor_matrix <- cor(df[, 1:10])
+print(cor_matrix)
+
+melted_cormat <- melt(cor_matrix)
+ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill=value)) + 
+    geom_tile() + 
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                         midpoint = 0, limit = c(-1,1), space = "Lab", 
+                         name="Pearson\nCorrelation") + 
+    theme_minimal() + 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                     size = 12, hjust = 1))
+
+```
+
+```{r}
+data_long <- gather(df[,1:10], key = "Variable", value = "Value")
+
+ggplot(data_long, aes(x=Value, fill=Variable)) + 
+    geom_density(alpha=0.7) +
+    facet_wrap(~ Variable, scales = "free") +
+    theme_minimal() +
+    labs(x = "Value", y = "Density", title = "Density Plots for Gamma Telescope")
+```
+
+```{r}
+ggplot(data_long, aes(x=1, y=Value, fill=Variable)) + 
+    geom_boxplot(outlier.color="red", outlier.shape=16) +
+    facet_wrap(~ Variable, scales = "free_y") +
+    theme_minimal() +
+    labs(x = "", y = "Value", title = "Boxplots of Numeric Variables") +
+    theme(legend.position="none")
+
+```
+```{r}
+outlier_ratio <- function(x) {
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR <- Q3 - Q1
+  lower_bound <- Q1 - 1.5 * IQR
+  upper_bound <- Q3 + 1.5 * IQR
+  sum(x < lower_bound | x > upper_bound) / length(x)
+}
+
+# Apply the function to each numeric column in the data frame
+outlier_ratios <- sapply(df[sapply(df, is.numeric)], outlier_ratio)
+
+# Display the ratios
+outlier_ratios
+```
+
+```{r}
+pca_result <- prcomp(df[, 1:10], scale.=TRUE)
+biplot(pca_result, scale=0)
+
+
+var_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+cum_var_explained <- cumsum(var_explained)
+
+ggplot(data.frame(PC=1:length(cum_var_explained), CumulativeVariance=cum_var_explained), aes(x=PC, y=CumulativeVariance)) +
+    geom_line() +
+    geom_point() +
+    labs(title="Cumulative Variance Explained by Principal Components",
+         x="Principal Component",
+         y="Cumulative Variance Explained") + 
+      scale_x_continuous(breaks = 1:length(cum_var_explained))
+
+```
+
+## Modeling
+
+When features are highly correlated, the regularization might distribute weights among these features, making it harder to interpret the importance of individual features. Also, when using a kernel, the relationships between features can become even more intertwined, and correlated features in the original space might behave unpredictably in the kernel-induced space.
+```{r}
+remove_outliers <- function(df) {
+  is_numeric <- sapply(df, is.numeric)
+  numeric_df <- df[, is_numeric]
+
+  # Function to identify outliers
+  is_outlier <- function(x) {
+    qnt <- quantile(x, probs=c(.25, .75), na.rm = T)
+    H <- 1.5 * IQR(x, na.rm = T)
+    x < (qnt[1] - H) | x > (qnt[2] + H)
+  }
+  
+  outlier_flags <- sapply(numeric_df, is_outlier)
+  
+  # Keep rows that are not outliers in any numeric columns
+  df[!rowSums(outlier_flags, na.rm = T), ]
+}
+
+# Apply the function to your data frame
+df <- remove_outliers(df)
+```
+
+```{r}
+# remove bc of high correlation
+df_preproc <- df %>% dplyr::select(-fConc1, -fLength)
+
+set.seed(123)
+split <- initial_split(df_preproc, prop = 0.8, strata = "class")
+
+train_data <- training(split)
+test_data <- testing(split)
+
+table(train_data$class)
+table(test_data$class)
+```
+
+```{r}
+
+recipe_obj <- recipe(class ~ ., data = train_data) %>% 
+  # Center and scale numerical features
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  # Remove highly correlated features (optional and you can adjust the threshold)
+  step_corr(all_numeric(), threshold = 0.9) %>%
+  prep(training = train_data)
+
+
+# Prepare the data using the recipe
+train_preprocessed <- recipe_obj %>% 
+  bake(new_data = NULL)
+
+test_preprocessed <- recipe_obj %>%
+  bake(test_data)
+
+```
+
+### Kernelized SVM
+#### RBF
+
+```{r}
+# might take a while...
+svm_params <- list(cost = 2^(c(-5, -3, -1, 0, 1, 3, 5)),
+                   gamma = 2^(c(-5, -3, -1, 0, 1, 3, 5)))
+
+# Perform grid search with 10-fold cross-validation
+set.seed(123)
+tune_result <- tune(svm, class ~ ., data = train_preprocessed, 
+                    kernel = "radial", ranges = svm_params, 
+                    tunecontrol = tune.control(cross = 10))
+
+print(tune_result)
+best_svm <- tune_result$best.model
+print(tune_result$best.parameters)
+```
+
+```{r}
+save(tune_result, file = "data/trainingTune.RData")
+```
+
+```{r}
+load("data/trainingTune.RData")
+```
+
+#### Polynomial Kernel
+
+```{r}
+# Define a more concise set of parameters for grid search.
+svm_params <- list(cost = 2^(c(-3, 0, 3)),
+                   degree = c(2, 3))  # Using only degrees 2 and 3.
+
+# Perform grid search with 10-fold cross-validation using polynomial kernel
+set.seed(123)
+tune_result_poly <- tune(svm, class ~ ., data = train_preprocessed, 
+                    kernel = "polynomial", ranges = svm_params, 
+                    tunecontrol = tune.control(cross = 10))
+
+print(tune_result_poly)
+best_svm_poly <- tune_result_poly$best.model
+print(tune_result_poly$best.parameters)
+
+```
+
+```{r}
+save(tune_result_poly, file = "data/tune_result_poly.RData")
+```
+
+#### Histogram Kernel
+
+```{r}
+histogram_kernel_matrix <- function(data) {
+  n <- nrow(data)
+  K <- matrix(0, n, n)
+  
+  for(i in 1:n) {
+    for(j in i:n) {
+      K[i,j] <- sum(pmin(as.numeric(data[i, ]), as.numeric(data[j, ])))
+      K[j,i] <- K[i,j] # Kernel matrix is symmetric
+    }
+  }
+  return(K)
+}
+
+K <- histogram_kernel_matrix(train_preprocessed %>% dplyr::select(-class))
+
+set.seed(123) 
+best_svm_hist <- ksvm(K, train_preprocessed$class, type = "C-svc", kernel = "matrix", 
+                      C = 1, kpar = list(xmatrix = K), cross = 10)
+
+cost_values <- 2^(c(-3, 0, 3))
+cross_validation_results <- sapply(cost_values, function(c) {
+  svm_model <- ksvm(K, train_preprocessed$class, type = "C-svc", kernel = "matrix", 
+                    C = c, kpar = list(xmatrix = K), cross = 10)
+  return(cross(svm_model))
+})
+
+
+best_index <- which.min(cross_validation_results)
+best_cost <- cost_values[best_index]
+best_svm_hist <- ksvm(K, train_preprocessed$class, type = "C-svc", kernel = "matrix", 
+                      C = best_cost, kpar = list(xmatrix = K))
+
+print(best_cost)
+print(cross_validation_results[best_index])
+
+save(best_svm_hist, file = "data/best_svm_hist.RData")
+save(K, file = "data/HistogramKDF.RData")
+
+```
+
+### Random Forest
+
+```{r}
+rf_params <- expand.grid(
+  mtry = c(2, 3, 4, 5, 6, 7),
+  splitrule = c("gini", "extratrees"),
+  min.node.size = c(1, 5, 10)
+)
+
+set.seed(123)
+
+tune_result_rf <- train(
+  class ~ ., data = train_preprocessed, 
+  method = "ranger", 
+  trControl = trainControl(method = "cv", number = 10),
+  tuneGrid = rf_params,
+  num.trees = 1000  
+)
+
+# Print the results
+print(tune_result_rf)
+print(tune_result_rf$bestTune)
+
+save(tune_result_rf, file = "data/trainingTuneRF.RData")
+```
+
+
+### KNN
+
+```{r}
+knn_params <- expand.grid(k = seq(1, 15, 2)) 
+
+set.seed(123)
+
+tune_result_knn <- train(
+  class ~ ., data = train_preprocessed, 
+  method = "knn", 
+  trControl = trainControl(method = "cv", number = 10),
+  tuneGrid = knn_params
+)
+
+print(tune_result_knn)
+print(tune_result_knn$bestTune)
+
+save(tune_result_knn, file = "data/trainingTuneKNN.RData")
+```
+### Evaluation
+
+```{r}
+load("data/trainingTune.RData")
+load("data/tune_result_poly.RData")
+load("data/best_svm_hist.RData")
+load("data/trainingTuneRF.RData")
+load("data/trainingTuneKNN.RData")
+load("data/HistogramKDF.RData")
+```
+
+
+```{r}
+predictions_svm <- predict(tune_result$best.model, train_preprocessed)
+predictions_svm_poly <- predict(tune_result_poly$best.model, train_preprocessed)
+predictions_svm_hist <- predict(best_svm_hist)
+predictions_rf <- predict(tune_result_rf, train_preprocessed)
+predictions_knn <- predict(tune_result_knn, train_preprocessed)
+```
+
+
+```{r}
+# ROC Curves
+roc_svm <- roc(response = train_preprocessed$class, predictor = as.numeric(predictions_svm == "g"))
+
+roc_svm_hist <- roc(response = train_preprocessed$class, predictor = as.numeric(predictions_svm_hist == "g"))
+
+roc_svm_poly <- roc(response = train_preprocessed$class, predictor =  as.numeric(predictions_svm_poly == "g"))
+
+roc_rf <- roc(response = train_preprocessed$class, predictor =  as.numeric(predictions_rf == "g"))
+
+roc_knn <- roc(response = train_preprocessed$class, predictor = as.numeric(predictions_knn == "g"))
+# Plotting ROC curves
+plot(roc_svm, col="red")
+lines(roc_svm_poly, col="blue")
+lines(roc_rf, col="green")
+lines(roc_knn, col="purple")
+lines(roc_svm_hist, col="black")
+legend("bottomright", legend=c("SVM", "SVM Poly", "RF", "KNN", "Histogram"),
+       col=c("red", "blue", "green", "purple", "black"), lty=1)
+
+# Confusion Matrices
+cm_svm <- confusionMatrix(predictions_svm, train_preprocessed$class)
+cm_svm_poly <- confusionMatrix(predictions_svm_poly, train_preprocessed$class)
+cm_rf <- confusionMatrix(predictions_rf, train_preprocessed$class)
+cm_knn <- confusionMatrix(predictions_knn, train_preprocessed$class)
+cm_svm_hist <- confusionMatrix(predictions_svm_hist, train_preprocessed$class)
+
+# Precision-Recall Curves
+pr_svm <- pr.curve(scores.class0 = as.numeric(predictions_svm == "g"), weights.class0 = as.numeric(train_preprocessed$class == "g"), curve = T)
+pr_svm_poly <- pr.curve(scores.class0 = as.numeric(predictions_svm_poly == "g"), weights.class0 = as.numeric(train_preprocessed$class == "g"), curve = T)
+pr_rf <- pr.curve(scores.class0 = as.numeric(predictions_rf == "g"), weights.class0 = as.numeric(train_preprocessed$class == "g"), curve = T)
+pr_knn <- pr.curve(scores.class0 = as.numeric(predictions_knn == "g"), weights.class0 = as.numeric(train_preprocessed$class == "g"), curve = T)
+pr_svm_histo <- pr.curve(scores.class0 = as.numeric(predictions_svm_hist == "g"), weights.class0 = as.numeric(train_preprocessed$class == "g"), curve = T)
+
+
+```
+
+
+```{r}
+plot(pr_svm, main = "PR Curve for SVM with RBF")
+plot(pr_svm_poly, main = "PR Curve for SVM with Polynomial")
+plot(pr_rf, main = "PR Curve for Random Forest")
+plot(pr_knn, main = "PR Curve for KNN")
+plot(pr_svm_histo, main = "PR Curve for SVM with Histogram")
+```
+
+
+```{r}
+
+best_model <- tune_result_rf
+
+final_preds <- predict(best_model, test_preprocessed)
+
+final_cm <- confusionMatrix(final_preds, test_preprocessed$class)
+
+final_cm
+
+best_roc <- roc(response = as.numeric(test_preprocessed$class == "g"), predictor =  as.numeric(final_preds == "g"))
+
+
+#svm_aux_preds <- predict(tune_result$best.model, test_preprocessed)
+#svm_roc_aux <- roc(response = as.numeric(test_preprocessed$class == "g"), predictor =  as.numeric(svm_aux_preds == "g"))
+plot(best_roc)
+#lines(svm_roc_aux, col="blue")
+
+plot(pr.curve(scores.class0 = as.numeric(final_preds == "g"), weights.class0 = as.numeric(test_preprocessed$class == "g"), curve = T))
+
+
+```
+
+
+
+
+
+
+
